@@ -46,7 +46,7 @@ multisub --account escience gpu-a40,gpu-rtx6k -- my-batch-script.sh arg1 arg2
 multisub --partition=escience:gpu-a40,psych:cpu-g2-memx2 -- my-batch-script.sh arg1 arg2
 
 # Submit a job to the first available partition from a list of partitions with one partition using a different account:
-"multisub" --account escience --partition=gpu-rtx6k,gpu-a40,psych:cpu-g2-mem2x -- my-batch-script.sh arg1 arg2
+multisub --account escience --partition=gpu-rtx6k,gpu-a40,psych:cpu-g2-mem2x -- my-batch-script.sh arg1 arg2
 
 # Submit a job to the first available partition from a list of partitions with a custom job name:
 multisub --partition=cpu,cpu-rtx6k --job-name=my-job -- my-batch-script.sh arg1 arg2
