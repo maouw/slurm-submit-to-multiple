@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
+
+scriptDir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" || { echo "Failed to determine script directory" >&2; exit 1; }
+progName="multisub"
+progVer="0.0.1"
+
+set -o pipefail -o errexit -o errtrace
+
+declare multisubTmpDir
+declare -a args
+declare -a partitions
+declare -a jobs
+
+# == Utility functions ==
+
+# Color codes:
+if ! [[ "$(tty -s)" ]]; then
+    colorReset="${colorReset:-$(tput sgr0)}"
+    colorBold="${colorBold:-$(tput bold)}"
+    colorError="${colorError:-$(tput setaf 1)}"
+    colorInfo="${colorInfo:-$(tput setaf 6)}"
+    colorSuccess="${colorSuccess:-$(tput setaf 2)}"
+    colorWarn="${colorWarn:-$(tput setaf 3)}"
+    colorDebug="${colorDebug:-$(tput setaf 5)}"
+fi
+
+# Print messages:
+function msg_err() {
+    echo "${colorError:-}${colorBold:-}ERROR:${colorReset:-} $*" >&2 || true
+}
+
+function msg_errexit() {
+    msg_err "$@" || true
+    exit "${exitCode:-1}"
+}
+
+function msg_warn() {
+    echo "${colorWarn:-}${colorBold:-}WARNING:${colorReset:-} $*" >&2 || true
+}
+
+function msg_info() {
+    echo "$*" >&2 || true
+}
+
+function msg_success() {
+    echo "${colorSuccess:-}$*${colorReset:-}" >&2 || true
+}
+
+if [[ "${MULTISUB_DEBUG:-}" =~ ^[yYtT1] ]]; then
+    export MULTISUB_DEBUG=1
+    function msg_debug() {
+        echo "${colorDebug:-}${colorBold:-}DEBUG:${colorReset:-} $*" >&2 || true
+    }
+else
+    function msg_debug() { :; }
+fi
+
+export -f msg_err msg_errexit msg_warn msg_info msg_success msg_debug
+
+function rebuild_batch_script() {
+    local scriptPath="$1"
+    local -i firstNonCommentLine=0
+
+    head -n 1 "${scriptPath}" | grep -q -E '^#!.*[[:space:]/](bash|sh|dash)' || msg_errexit "Only bash or sh scripts are supported"
+
+    firstNonCommentLine="$(awk '!/^\s*#(!|SBATCH)/ {print FNR; exit}' "${scriptPath}" || echo 0)"
+    ((firstNonCommentLine < 1)) && firstNonCommentLine=1
+    head -n $((firstNonCommentLine - 1)) "${scriptPath}" >"${multisubTmpDir}/newBatchScript.job" || msg_errexit "Failed to write batch script header to \"${multisubTmpDir}/newBatchScript.job\""
+
+    if [[ -z "${MULTISUB_INCLUDE_PATH:-}" ]]; then
+        MULTISUB_INCLUDE_PATH="${multisubTmpDir}/multisub.inc.sh"
+        cat <<'EOF' >>"${MULTISUB_INCLUDE_PATH}" || msg_errexit "Failed to write to MULTISUB_INCLUDE_PATH=\"${MULTISUB_INCLUDE_PATH}\""
+# <Injected by multisub>
+# shellcheck shell=posix
+[ "${MULTISUB_DEBUG:-0}" != 0 ] && set -x
+
+__ms_errexit() { echo "MULTISUB ERROR (JobId=${SLURM_JOB_ID}): $*" >&2 || true; exit 1; }
+
+# Get the KillWait value from the Slurm configuration:
+__ms_killwait="$(scontrol show config | sed -nE 's/^KillWait.*=\s*([0-9]+)\s*sec$/\1/p' || echo 10)"
+
+# Make jobs singleton in order to prevent other jobs from running:
+scontrol update jobname="${SLURM_JOB_NAME}" dependency=singleton >/dev/null 2>&1 || true
+
+# Cancel any pending jobs with the same name:
+scancel --me --name="${SLURM_JOB_NAME}" --state=PENDING || true
+
+# Find jobs that are already running or configuring, order by status and job id:
+__ms_found_jobs="$(squeue --noheader --me --states=CONFIGURING,RUNNING --name="$SLURM_JOB_NAME" --format='%i' --sort=-t,S,i | grep -E '^[0-9]+' | paste -s -d, || true)"
+
+# If no jobs are found, exit:
+[ -n "${__ms_found_jobs:-}" ] || __ms_errexit "No jobs found with the name \"${SLURM_JOB_NAME}\""
+
+# Get the first job id:
+__ms_head_job="${__ms_found_jobs%%,*}"
+
+# Get the remaining job ids:
+__ms_other_jobs="${__ms_found_jobs#*,}"
+
+# If there are any jobs found, cancel all but the first one:
+if [ -n "${__ms_other_jobs:-}" ] && [ "${__ms_other_jobs}" != "${__ms_head_job:-}" ]; then
+    # shellcheck disable=SC2086
+    scancel --full ${__ms_other_jobs} || true
+fi
+
+# If this isn't the first job, wait until cancellation is complete or exit if timed out:
+if ! [ "${__ms_head_job:-}" = "${SLURM_JOB_ID}" ]; then
+    sleep $((__ms_killwait * 2))
+    __ms_errexit "Job ${SLURM_JOB_ID} is supposed to exit because the winning candidate is job ${__ms_head_job}, but it did not receive an scancel signal in time. Exiting."
+fi
+
+# Remove --candidate suffix from job:
+scontrol update jobid="${SLURM_JOB_ID}" jobname="${SLURM_JOB_NAME%--candidate}" || __msg_errexit "Could not update job name to \"${SLURM_JOB_NAME%--candidate}\""
+
+unset -v  __ms_found_jobs __ms_head_job __ms_other_jobs __ms_killwait >/dev/null 2>&1
+unset -f __ms_errexit >/dev/null 2>&1
+# </Injected by multisub>
+EOF
+    fi
+
+    if [[ -f "${MULTISUB_INCLUDE_PATH:-}" ]]; then
+        cat "${MULTISUB_INCLUDE_PATH}" >>"${multisubTmpDir}/newBatchScript.job" || msg_errexit "Failed to append include file \"${MULTISUB_INCLUDE_PATH}\""
+    else
+        msg_warn "Include file not found: \"${MULTISUB_INCLUDE_PATH}\""
+    fi
+
+    tail -n +"${firstNonCommentLine}" "${scriptPath}" >>"${multisubTmpDir}/newBatchScript.job" || msg_errexit "Failed to append remaining batch script to \"${multisubTmpDir}/newBatchScript.job\""
+
+    return 0
+}
+
+usage() {
+    cat <<EOF
+${progName} v${progVer}
+
+Usage: ${progName} [--help] [SBATCH_OPTIONS] -- [args to script...]
+
+Submit a job to the first available partition from a list of partitions.
+
+All arguments are passed to sbatch except for those after the double dash (--), which are passed to the batch script.
+
+You must provide a valid SLURM batch script as the first argument before '--'. Only bash or sh scripts are supported. The script must contain a shebang line with the path to the bash or sh interpreter. Arguments after '--' are passed to the batch script.
+
+To specify the partitions to submit the job to, use the -p or --partition option. If the -p or --partition option is not provided, ${progName} will use the partitions specified in the SBATCH_PARTITION environment variable. The partitions must be comma-separated. ${progName} will pass each partition to sbatch separately.
+
+If you would like to specify multiple account/partition pairs, you can use the format "account:partition" in the -p or --partition option. Partitions specified without an account prefix will use the account specified in the --account option or the SBATCH_ACCOUNT environment variable. For example, "--account account1 --partition partition1,partition2,account2:partition3" will submit the job to partition1 with account1, partition2 with account1, and partition3 with account2.
+
+If the -J or --job-name option is not provided, ${progName} will generate a unique job name.
+
+Options:
+  -h, --help                 Display this help message and exit.
+
+
+Examples:
+    # Submit a job to the first available partition from a list of partitions:
+    ${progName} --account escience gpu-a40,gpu-rtx6k -- my-batch-script.sh arg1 arg2
+
+    # Submit a job to partitions using different accounts:
+    ${progName} --partition=escience:gpu-a40,psych:cpu-g2-memx2 -- my-batch-script.sh arg1 arg2
+
+    # Submit a job to the first available partition from a list of partitions with one partition using a different account:
+    "${progName}" --account escience --partition=gpu-rtx6k,gpu-a40,psych:cpu-g2-mem2x -- my-batch-script.sh arg1 arg2
+
+    # Submit a job to the first available partition from a list of partitions with a custom job name:
+    ${progName} --partition=cpu,cpu-rtx6k --job-name=my-job -- my-batch-script.sh arg1 arg2
+EOF
+}
+
+function sbatch_with_err() {
+    sbatch "${@}" 2> >(grep -oP -m2 '^sbatch:\s*error:\s*\K.*' | paste -s -d $'\030' | sed "s/"$'\030'"/ -- /" | tee "${multisubTmpDir}/err.msg" >&2 || true)
+}
+
+# Delete temporary directory on exit:
+trap '[[ -n "${multisubTmpDir:-}" ]] && [[ "${MULTISUB_DEBUG:-0}" != 1 ]] && rm -rf "${multisubTmpDir}"' EXIT
+
+# Handler for errexit in functions:
+trap 'exitCode=$?; trap - ERR; set +e; msg_err "Error at ${BASH_SOURCE[1]}:${BASH_LINENO[*]} command: ${BASH_COMMAND}"; ((${#jobs} > 0)) && { msg_info "Canceling jobs ${jobs[*]}"; scancel "${jobs[@]}"; }; exit ${exitCode}' ERR
+
+if [[ "${MULTISUB_XTRACE:-}" =~ ^[yYtT1] ]]; then
+    export MULTISUB_XTRACE=1
+    set -x
+fi
+
+# Parse command-line arguments:
+# shellcheck disable=SC2206
+
+[[ "${1:-}" == "--help" ]] && { usage; exit 0; }
+
+while (($# > 0)); do
+    case "${1:-}" in
+        --)
+            batchScript="${2:-}"
+            shift 2 || msg_errexit "You must provide a batch script after '--'"
+            if [[ -f "${batchScript}" ]]; then
+                batchScriptPath="$(realpath "${batchScript}")"
+            elif command -v "${batchScript}" &>/dev/null; then
+                batchScriptPath="$(command -v "${batchScript}")"
+            else
+                msg_errexit "Batch script not found at \"${batchScript}\""
+            fi
+            [[ -r "${batchScriptPath}" ]] || msg_errexit "Batch script is not readable from \"${batchScriptPath}\""
+            break
+            ;;
+        --partition=?* | --job-name=?* | --account=?*)
+            # Handle --option=value args
+            set -- "${1%%=*}" "${1#*=}" "${@:2}"
+            continue
+            ;;
+        -p?* | -J?* | -A?*)
+            # Handle -oValue args
+            set -- "${1::2}" "${1:2}" "${@:2}"
+            continue
+            ;;
+        -p | --partition)
+            SBATCH_PARTITION="${2:-}"
+            shift 2 || msg_errexit "${1} requires an argument"
+            ;;
+        -J | --job-name)
+            SBATCH_JOB_NAME="${2:-}"
+            shift 2 || msg_errexit "${1} requires an argument"
+            ;;
+        -A | --account)
+            SBATCH_ACCOUNT="${2:-}"
+            shift 2 || msg_errexit "${1} requires an argument"
+            ;;
+        *)
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[[ -n "${batchScript:-}" ]] || { msg_err "No batch script provided"; usage >&2; exit 1; }
+
+# If SBATCH_PARTITION is set, split it into an array:
+# shellcheck disable=SC2206
+[[ -n "${SBATCH_PARTITION:-}" ]] && partitions+=(${SBATCH_PARTITION//,/ }) # e.g. -p cpu,cpu-rtx6k -> partitions=(cpu cpu-rtx6k)
+
+# If SBATCH_JOB_NAME is set, use it as the job name:
+[[ -n "${SBATCH_JOB_NAME:-}" ]] && jobName="${SBATCH_JOB_NAME}"
+
+# If SBATCH_ACCOUNT is set, use it as the account:
+[[ -n "${SBATCH_ACCOUNT:-}" ]] && account="--account=${SBATCH_ACCOUNT}"
+
+# Unset variables to avoid passing them to sbatch:
+unset SBATCH_PARTITION SBATCH_JOB_NAME SBATCH_ACCOUNT
+
+# Deduplicate partitions:
+# shellcheck disable=SC2207
+partitions=($(echo "${partitions[@]}" | tr "[:space:]" '\n' | awk '!a[$0]++'))
+
+# Check if any partitions were specified:
+((${#partitions[@]} > 0)) || msg_errexit "No partitions specified"
+
+# Generate a unique job name if one was not provided:
+[[ -z "${jobName:-}" ]] && printf -v jobName 'multisub--%s' "${partitions[*]}"
+jobNameAttempts=0
+while :; do
+    printf -v tempJobName '%s--%s--candidate' "${jobName}" "${RANDOM}"
+    tempJobName="${tempJobName// /,}"
+    squeue --noheader --format "%j" --user "${USER}" --name "${tempJobName}" | grep -q '.' || { jobName="${tempJobName}"; break; }
+    if ((jobNameAttempts++ > 20)); then
+        msg_errexit "Failed to generate a unique job name after ${jobNameAttempts} attempts"
+    fi
+done
+
+# Print debug information:
+msg_debug "$(declare -p partitions)"
+msg_debug "jobName: ${jobName}"
+msg_debug "$(declare -p args)"
+
+multisubTmpDir="$(mktemp -d)" || msg_errexit "Failed to create temporary directory"
+
+# Rebuild batch script with include file:
+rebuild_batch_script "${batchScriptPath}" || msg_errexit "Failed to rebuild batch script at \"${batchScriptPath}\""
+
+# Submit job to each partition with the new batch script:
+for partition in "${partitions[@]}"; do
+    # Check if the partition is different from the account:
+    if [[ "${partition#*:}" != "${partition:-}" ]]; then
+        accountSpec="--account=${partition%%:*}"
+        partition="${partition#*:}"
+    else
+        accountSpec="${account:-}"
+    fi
+    msg_info "Submitting candidate job to partition \"${partition}\"${accountSpec:+ with account \"${accountSpec#--account=}\"}"
+    if ! job="$(sbatch_with_err --job-name "${jobName}" --partition "${partition}" ${accountSpec:-} --parsable "${args[@]}" "${multisubTmpDir}/newBatchScript.job" "$@")"; then
+        msg_warn "Failed to submit candidate job to partition \"${partition}\"${accountSpec:+ with account \"${accountSpec#--account=}\"}. Skipping. ($(<"${multisubTmpDir}/err.msg"))"
+        continue
+    fi
+    jobs+=("${job%%;*}")
+done
+
+# Check if any jobs were submitted:
+((${#jobs[@]} > 0)) || msg_errexit "No jobs were submitted"
+
+# Success!
+msg_success "Job submission complete! Your job will run on the first available partition. Once the job is runnning, it will be renamed to \"${jobName%--candidate}\". The list of partitions and job IDs are shown below."
+
+# Print partitions and job IDs:
+squeue --me --name "${jobName}" --format '%.18i %.10a %.10P' || msg_errexit "Failed to list job IDs for job name \"${jobName}\""
